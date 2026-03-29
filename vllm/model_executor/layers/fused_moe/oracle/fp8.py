@@ -52,6 +52,7 @@ class Fp8MoeBackend(Enum):
     VLLM_CUTLASS = "VLLM_CUTLASS"
     BATCHED_VLLM_CUTLASS = "BATCHED_VLLM_CUTLASS"
     XPU = "XPU"
+    ROUTEMOE = "ROUTEMOE"
 
 
 def _get_priority_backends(
@@ -183,6 +184,13 @@ def backend_to_kernel_cls(
 
         return [XPUExpertsFp8]
 
+    elif backend == Fp8MoeBackend.ROUTEMOE:
+        from vllm.model_executor.layers.fused_moe.routemoe_experts import (
+            RouteMoEExperts,
+        )
+
+        return [RouteMoEExperts]
+
     else:
         raise ValueError(f"Unknown FP8 MoE backend: {backend.value}")
 
@@ -197,6 +205,7 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
         "flashinfer_cutlass": Fp8MoeBackend.FLASHINFER_CUTLASS,
         "marlin": Fp8MoeBackend.MARLIN,
         "aiter": Fp8MoeBackend.AITER,
+        "routemoe": Fp8MoeBackend.ROUTEMOE,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -410,6 +419,42 @@ def select_fp8_moe_backend(
     return Fp8MoeBackend.NONE, None
 
 
+def prepare_fp8_moe_layer_for_routemoe(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    block_quant: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare weights and scales for the RouteMoE kernel at load time.
+
+    1. Interleave gate/up weight columns (8-col granularity)
+    2. Broadcast weight scales to (E, ceil(N/128), ceil(K/128)) block format
+       so apply() doesn't recompute every forward call.
+    """
+    import math
+    from vllm.model_executor.layers.fused_moe.routemoe.dispatch import (
+        interleave_tensor,
+    )
+    w13 = interleave_tensor(w13)
+    if block_quant and w13_scale.dim() == 3:
+        w13_scale = interleave_tensor(w13_scale, rep=1)
+
+    E, full_N, K = w13.shape
+    N_half = full_N // 2
+
+    def _broadcast(s, E, rows, cols, block=128):
+        target = (E, math.ceil(rows / block), math.ceil(cols / block))
+        if s.shape == target:
+            return s
+        return s.reshape(E, *([1] * (3 - s.dim()))).expand(target).contiguous()
+
+    w13_scale = _broadcast(w13_scale, E, full_N, K)
+    w2_scale = _broadcast(w2_scale, E, K, N_half)
+
+    return w13, w2, w13_scale, w2_scale
+
+
 def convert_to_fp8_moe_kernel_format(
     fp8_backend: Fp8MoeBackend,
     layer: torch.nn.Module,
@@ -454,6 +499,9 @@ def convert_to_fp8_moe_kernel_format(
             w2_input_scale=w2_input_scale,
             is_trtllm=(fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM),
         )
+    elif fp8_backend == Fp8MoeBackend.ROUTEMOE:
+        w13, w2, w13_scale, w2_scale = prepare_fp8_moe_layer_for_routemoe(
+            w13, w2, w13_scale, w2_scale, block_quant)
     else:
         if fp8_backend not in [
             Fp8MoeBackend.TRITON,
